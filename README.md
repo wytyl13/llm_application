@@ -218,3 +218,162 @@ base_url一般是http的
     # 获取当前对话的回答
     logger.info(response['response'])
 ```
+
+##### Naive RAG system
+```
+retrieval augmented generation.
+索引
+检索
+
+结构化数据库 0, ... 
+全文检索 
+0 我
+
+我是谁 file_1
+我来自哪里？file_2
+
+我 file_1, file_2
+是 file_1
+谁 file_1
+来自 file_2
+哪里 file_2
+elasticsearch
+
+来自
+来往
+
+embedding
+我是谁
+我来自哪里？
+我 file_1 [1, 2, 3, 4, 5]  512
+是 file_1
+谁 file_1
+我 file_2
+来自 file_2
+哪里 file_2
+
+我是谁？--> embedding [1, 2, 3, 4, 5, 6], dimension is 512
+
+<!-- query_embedding @ database_embedding -->
+database_embedding(6, 512) @ query_embedding(512, 1) = score(6, 1)
+
+余弦相似度
+[1, 1, 1, 1, 1]
+[1, 1, 1, 1, 1]
+cos_theta = 点积 / （根号下（向量A每个元素的平方和）* 根号下（向量B每个元素的平方和））
+cos_theta = 5 / 5 = 1
+
+
+检索方法：文本检索（倒排索引）和语义检索（embedding 向量相似度）
+前者的优势是效率高，后者的优势是可以检索到多重词汇
+
+倒排索引一般应用于数据库较完善的全文检索
+
+实现功能
+在chat system接口的基础上 添加知识库
+详细规则如下：
+在缓存历史聊天记录的基础上，添加知识库检索的功能
+如：当给出指令去知识库检索后回答的时候，此时将会是一个参考知识库的独立回答
+然后将本次回答的内容存储到聊天缓存中，作为后续回答的上下文参考依据
+
+1 将文件数据制作成向量数据库存储到磁盘中
+    1 多模态文件读取成文本
+        pip install unstructured -i https://pypi.tuna.tsinghua.edu.cn/simple/
+        from langchain.document_loaders import PyPDFLoader
+        from langchain.document_loaders import CSVLoader
+        from langchain.document_loaders import UnstructuredWordDocumentLoader
+        from langchain.document_loaders import TextLoader
+        from langchain.document_loaders import UnstructuredMarkdownLoader
+        from unstructured.file_utils.filetype import FileType, detect_filetype
+        file_loaders ={
+            FileType.CSV: CSVLoader,
+            FileType.TXT: TextLoader,
+            FileType.DOCX: UnstructuredWordDocumentLoader,
+            FileType.PDF: PyPDFLoader,
+            FileType.MD: UnstructuredMarkdownLoader
+        }
+        file_path = "/root/autodl-tmp/llm_dev/data/LLM-v1.0.0(1).pdf"
+        file_type = detect_filetype(file_path)
+        file_loader = file_loaders[file_type]
+        loader = file_loader(file_path)
+        documents = loader.load()
+    2 文本分割
+        字符分割、递归分割、句子分割、命题分割（可以将句子独立）
+        https://www.rungalileo.io/blog/mastering-rag-advanced-chunking-techniques-for-llm-applications#propositions
+        langchain中提供了各种分割器
+        https://chunkviz.up.railway.app/
+        from langchain.text_splitter import RecursiveCharacterTextSplitter
+        text_split = RecursiveCharacterTextSplitter(
+            chunk_size = 1000, 
+            chunk_overlap = 200
+        )
+        texts = text_split.split_documents(documents)
+
+    3 embedding模型
+        pip install tiktoken pypdf sentence_transformers -i https://mirrors.cloud.tencent.com/pypi/simple/
+        from langchain_community.embeddings import HuggingFaceBgeEmbeddings
+        model_kwargs = {'device': 'cuda'}
+        model_name = '/root/autodl-tmp/bge-small-zh-v1.5'
+        embeddings = HuggingFaceBgeEmbeddings(
+            model_name = model_name, 
+            model_kwargs = model_kwargs    
+        )
+        print(embeddings.embed_query("我是谁"))
+
+    4 使用向量数据库存储到本地磁盘
+        pip install faiss-gpu -i https://pypi.tuna.tsinghua.edu.cn/simple/
+        from langchain.vectorstores import FAISS
+        persist_directory_chinese = '/root/autodl-tmp/llm_dev/data/index'
+        db = FAISS.from_documents(texts, embeddings)
+        db.save_local(persist_directory_chinese)
+
+2 检索增强生成
+    1 检索
+        余弦距离：夹角 不看向量长度
+        点积
+        欧氏距离
+        model_kwargs = {'device': 'cuda'}
+        model_name = '/root/autodl-tmp/bge-small-zh-v1.5'
+        embeddings = HuggingFaceBgeEmbeddings(
+            model_name = model_name, 
+            model_kwargs = model_kwargs    
+        )
+        from langchain.vectorstores import FAISS
+        query = "什么是基本语义相似度?"
+        db = FAISS.load_local(
+            persist_directory_chinese, 
+            embeddings=embeddings,
+            allow_dangerous_deserialization=True
+        )
+        docs = db.similarity_search(query, k=3)
+        print(docs)
+    2 增强回答
+        # RetrievalQA
+        from langchain.chains import RetrievalQA
+        retriever = db.as_retriever(search_type="mmr", search_kwargs={"k":3})
+        qa = RetrievalQA.from_chain_type(
+            llm=llm, 
+            chain_type="stuff", 
+            retriever=retriever, 
+            return_source_documents=True
+        )
+        query = "什么是基本语义相似度?"
+        result = qa({"query": query})
+        print(result['result'])
+        print(result['source_documents'])
+        
+    3 上下文记忆增强回答
+        from langchain.memory import ConversationSummaryMemory
+        from langchain.chains import ConversationalRetrievalChain
+        db = FAISS.load_local(
+            '/root/autodl-tmp/llm_dev/data/index', 
+            embeddings=embeddings,
+            allow_dangerous_deserialization=True
+        )
+        retriever = db.as_retriever(search_type="mmr", search_kwargs={"k":3})
+        memory = ConversationSummaryMemory(llm=llm, memory_key="chat_history", return_messages=True)
+        qa = ConversationalRetrievalChain.from_llm(llm,retriever=retriever,memory=memory)
+        question ="什么是基本语义相似度?"
+        result = qa(question)
+        print(result['answer'])
+```
